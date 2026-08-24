@@ -1,0 +1,7 @@
+Timestamp,Asset,Direction,Entry Price,Exit Price,PnL,Notes,Type,Entry,Stop,Target,Score,Open,Qty,Price,Stop Loss,Take Profit,Status,Closed At,Strategy
+2026-04-05 12:46:58,HH,Long,2.806999921798706,2.806999921798706,0.0,,,,,,,,,,,,,,
+2026-04-06 16:04:18,TTF_JKM,Short,50.04399871826172,50.04399871826172,0.0,,,,,,,,,,,,,,Trend
+2026-04-07 14:22:43,HH,Long,2.8289999961853027,2.86899995803833,0.0399999618530273,,,,,,,,,,,,,,Trend
+2026-04-13 18:11:25,TTF,Long,15.87090137867931,15.912739596891898,0.2091910910629391,"Testing signal conviction.
+",,,,,,,,,,,,,Trend
+2026-06-01 15:35:05,HH,Long,2.805999994277954,3.196000099182129,0.3900001049041748,,,,,,,,,,,,,,Trend
