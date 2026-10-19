@@ -1,0 +1,11 @@
+streamlit
+pandas
+numpy
+plotly
+yfinance
+openpyxl
+pathlib
+datetime
+requests
+flask
+gunicorn
