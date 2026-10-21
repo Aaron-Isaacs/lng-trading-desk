@@ -111,6 +111,32 @@ def evaluate_strategy():
         send_telegram_alert(alert_text)
         print(f"Alert sent! {direction} at ${current_price:.3f}")
 
+def calculate_trade_parameters(entry_price: float, signal_type: str, rolling_std: float, rolling_mean: float):
+    """
+    Calculates dynamic Stop Loss, Take Profit, and Max Hold Duration.
+    """
+    # Use 1.5x rolling standard deviation as a volatility-based stop buffer
+    stop_distance = max(1.5 * rolling_std, 0.02)  # Floor at $0.02 minimum buffer
+    
+    if signal_type == "SHORT":
+        stop_loss = entry_price + stop_distance
+        # Mean reversion target is the rolling mean; floor at 1.5:1 Risk-to-Reward
+        take_profit = min(rolling_mean, entry_price - (1.5 * stop_distance))
+    else:  # LONG
+        stop_loss = entry_price - stop_distance
+        take_profit = max(rolling_mean, entry_price + (1.5 * stop_distance))
+    
+    risk_per_unit = abs(entry_price - stop_loss)
+    reward_per_unit = abs(take_profit - entry_price)
+    rr_ratio = reward_per_unit / risk_per_unit if risk_per_unit > 0 else 0
+
+    return {
+        "Stop Loss": round(stop_loss, 3),
+        "Take Profit": round(take_profit, 3),
+        "R:R Ratio": round(rr_ratio, 2),
+        "Max Duration": "12 bars (60 mins)"
+    }
+
 def run_loop():
     print("Starting background strategy loop...")
     send_telegram_alert("🟢 *LNG Alert Engine is Online*\nMonitoring Henry Hub & TTF signals every 5 minutes.")
