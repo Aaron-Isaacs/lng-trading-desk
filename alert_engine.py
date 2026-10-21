@@ -4,10 +4,10 @@ import time
 import threading
 import requests
 import pandas as pd
-import yfinance as yf
+import numpy as np
 from flask import Flask
 
-# Point to 'src' directory for custom modules
+# Point to 'src' directory for custom modules (leaves your Streamlit desk untouched)
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "src")))
 
 from features import build_features
@@ -41,17 +41,20 @@ def send_telegram_alert(message: str):
         print(f"❌ Failed to send Telegram alert: {e}")
 
 def calculate_trade_parameters(entry_price: float, signal_type: str, rolling_std: float, rolling_mean: float):
+    # Volatility-based stop loss (1.5x standard deviation, minimum $0.02)
     stop_distance = max(1.5 * rolling_std, 0.02)
+    
     if signal_type in ["SHORT", "SELL"]:
         stop_loss = entry_price + stop_distance
         take_profit = min(rolling_mean, entry_price - (1.5 * stop_distance))
-    else:
+    else:  # LONG / BUY
         stop_loss = entry_price - stop_distance
         take_profit = max(rolling_mean, entry_price + (1.5 * stop_distance))
     
     risk = abs(entry_price - stop_loss)
     reward = abs(take_profit - entry_price)
     rr = reward / risk if risk > 0 else 0
+    
     return {"sl": round(stop_loss, 3), "tp": round(take_profit, 3), "rr": round(rr, 2)}
 
 def fetch_market_data():
@@ -59,7 +62,7 @@ def fetch_market_data():
     try:
         url = "https://query1.finance.yahoo.com/v8/finance/chart/NG=F?interval=5m&range=5d"
         headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
         }
         res = requests.get(url, headers=headers, timeout=10)
         
@@ -73,17 +76,19 @@ def fetch_market_data():
         closes = result["indicators"]["quote"][0]["close"]
 
         df = pd.DataFrame({"HH": closes}, index=pd.to_datetime(timestamps, unit="s"))
+        df["HH"] = df["HH"].ffill().bfill()
         df = df.dropna()
 
         if len(df) < 25:
             print(f"⚠️ Warning: Insufficient candles fetched ({len(df)}/25 minimum).")
             return pd.DataFrame()
 
-        # Synthetic proxies for pipeline compatibility
+        # Dynamic proxy generation with tiny variance (prevents std=0 division errors in features.py)
+        n = len(df)
         df["TTF"] = df["HH"] * 4.0
         df["JKM"] = df["TTF"] * 1.15
-        df["ARA_COAL"] = 100.0
-        df["NEWC_COAL"] = 100.0
+        df["ARA_COAL"] = 100.0 + np.sin(np.linspace(0, 10, n))
+        df["NEWC_COAL"] = 100.0 + np.cos(np.linspace(0, 10, n))
 
         return df
     except Exception as e:
@@ -96,7 +101,10 @@ def evaluate_strategy():
     if df.empty:
         return
 
+    # Pass data into original features and regime modules
     df_features = build_features(df)
+    df_features = df_features.replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(0)
+
     df_regimes = build_regime_map(df_features)
     if df_regimes.empty:
         print("⚠️ Warning: Regime map returned empty.")
@@ -104,20 +112,22 @@ def evaluate_strategy():
 
     latest_row = df_regimes.iloc[-1]
     current_price = latest_row["HH"]
-    market_state = latest_row["MARKET_STATE"]
+    market_state = latest_row.get("MARKET_STATE", "NORMAL")
 
     signals_dict = compute_all_signals(df_regimes)
     strategy_df = get_all_strategy_signals(df_regimes)
 
     if strategy_df.empty:
-        print(f"ℹ️ Engine active. Current HH: ${current_price:.3f} (No signals generated).")
+        print(f"ℹ️ Engine active. Current HH: ${current_price:.3f} (No strategies active).")
         return
 
+    # Filter strictly for Henry Hub strategies
     hh_strategies = strategy_df[strategy_df["Asset"] == "HH"]
     if hh_strategies.empty:
-        print(f"ℹ️ Engine active. Current HH: ${current_price:.3f} (No HH strategies active).")
+        print(f"ℹ️ Engine active. Current HH: ${current_price:.3f} (No HH signals).")
         return
 
+    # Select the highest conviction Henry Hub signal
     top_signal = hh_strategies.sort_values(by="Conviction", ascending=False).iloc[0]
     direction = top_signal["Signal"]
     strategy_name = top_signal["Strategy"]
@@ -126,9 +136,11 @@ def evaluate_strategy():
 
     print(f"📊 Evaluated HH: ${current_price:.3f} | Top: {strategy_name} {direction} | Conviction: {conviction*100:.1f}%")
 
+    # Gatekeeper: Require >= 60% conviction
     if conviction < 0.60:
         return
 
+    # Calculate Stop Loss, Take Profit, and Risk/Reward
     rolling_std = latest_row["HH_VOL"]
     rolling_mean = df_regimes["HH"].rolling(20).mean().iloc[-1]
     risk_params = calculate_trade_parameters(current_price, direction, rolling_std, rolling_mean)
@@ -151,14 +163,14 @@ def evaluate_strategy():
             f"**Stop Loss:** `${risk_params['sl']}`\n"
             f"**Take Profit:** `${risk_params['tp']}`\n"
             f"**Risk/Reward:** `1:{risk_params['rr']}`\n"
-            f"**Max Hold:** `60 mins`\n\n"
+            f"**Max Hold Duration:** `60 mins`\n\n"
             f"**Market State:** `{market_state}`"
         )
         send_telegram_alert(alert_text)
 
 def run_loop():
-    print("🚀 Starting background strategy monitoring loop...")
-    send_telegram_alert("🟢 *LNG Alert Engine Online*\nTesting Telegram integration & starting live loop...")
+    print("🚀 Starting background HH strategy monitoring loop...")
+    send_telegram_alert("🟢 *LNG Alert Engine Online*\nMonitoring Henry Hub setups with dynamic risk management.")
     while True:
         try:
             evaluate_strategy()
@@ -166,7 +178,7 @@ def run_loop():
             print(f"❌ Engine loop error: {e}")
         time.sleep(300)
 
-# Start background thread
+# Start background thread for 24/7 monitoring
 loop_thread = threading.Thread(target=run_loop, daemon=True)
 loop_thread.start()
 
