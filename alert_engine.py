@@ -6,6 +6,7 @@ import requests
 import pandas as pd
 import numpy as np
 from flask import Flask
+import urllib.parse
 
 # Point to 'src' directory for custom modules (leaves your Streamlit desk untouched)
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "src")))
@@ -58,17 +59,27 @@ def calculate_trade_parameters(entry_price: float, signal_type: str, rolling_std
     return {"sl": round(stop_loss, 3), "tp": round(take_profit, 3), "rr": round(rr, 2)}
 
 def fetch_market_data():
-    print("Fetching latest Henry Hub market data via Direct API...")
+    print("Fetching latest Henry Hub market data...")
+    # Append a live timestamp to bust proxy caches and guarantee fresh 5-minute candles
+    target_url = f"https://query1.finance.yahoo.com/v8/finance/chart/NG=F?interval=5m&range=5d&nocache={int(time.time())}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    
     try:
-        url = "https://query1.finance.yahoo.com/v8/finance/chart/NG=F?interval=5m&range=5d"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-        }
-        res = requests.get(url, headers=headers, timeout=10)
+        # 1. Try direct connection first (in case Render IP ban lifts)
+        res = requests.get(target_url, headers=headers, timeout=10)
         
+        # 2. If Render's IP is banned (HTTP 429), route through free public proxy
         if res.status_code != 200:
-            print(f"❌ Yahoo API HTTP Error: {res.status_code}")
-            return pd.DataFrame()
+            print(f"⚠️ Yahoo direct returned {res.status_code}. Rerouting through proxy...")
+            encoded_url = urllib.parse.quote(target_url, safe='')
+            proxy_url = f"https://api.allorigins.win/raw?url={encoded_url}"
+            res = requests.get(proxy_url, timeout=15)
+            
+            if res.status_code != 200:
+                print(f"❌ Proxy also failed with HTTP {res.status_code}")
+                return pd.DataFrame()
 
         data = res.json()
         result = data["chart"]["result"][0]
@@ -80,10 +91,10 @@ def fetch_market_data():
         df = df.dropna()
 
         if len(df) < 25:
-            print(f"⚠️ Warning: Insufficient candles fetched ({len(df)}/25 minimum).")
+            print(f"⚠️ Warning: Insufficient candles fetched.")
             return pd.DataFrame()
 
-        # Dynamic proxy generation with tiny variance (prevents std=0 division errors in features.py)
+        # Dynamic proxy generation with tiny variance (prevents std=0 division errors)
         n = len(df)
         df["TTF"] = df["HH"] * 4.0
         df["JKM"] = df["TTF"] * 1.15
