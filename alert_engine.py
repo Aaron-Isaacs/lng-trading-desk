@@ -37,22 +37,21 @@ def send_telegram_alert(message: str):
         print(f"Failed to send alert: {e}")
 
 def fetch_market_data():
-    print("Fetching latest Henry Hub & TTF market data...")
+    print("Fetching latest Henry Hub market data...")
     try:
         hh_raw = yf.Ticker("NG=F").history(period="5d", interval="5m")
-        ttf_raw = yf.Ticker("TTF=F").history(period="5d", interval="5m")
 
-        if hh_raw.empty or ttf_raw.empty:
+        if hh_raw.empty:
             return pd.DataFrame()
 
-        hh = hh_raw["Close"].rename("HH")
-        ttf = ttf_raw["Close"].rename("TTF")
-
-        df = pd.concat([hh, ttf], axis=1).ffill().dropna()
+        df = pd.DataFrame()
+        df["HH"] = hh_raw["Close"].ffill().dropna()
 
         if df.empty or len(df) < 25:
             return pd.DataFrame()
 
+        # Synthetic proxies to keep feature engineering pipeline stable without extra yfinance calls
+        df["TTF"] = df["HH"] * 4.0
         df["JKM"] = df["TTF"] * 1.15
         df["ARA_COAL"] = 100.0
         df["NEWC_COAL"] = 100.0
@@ -80,36 +79,59 @@ def evaluate_strategy():
     signals_dict = compute_all_signals(df_regimes)
     strategy_df = get_all_strategy_signals(df_regimes)
 
+    if strategy_df.empty:
+        return
+
+    # Strictly filter for Henry Hub strategy signals
     hh_strategies = strategy_df[strategy_df["Asset"] == "HH"]
+
     if hh_strategies.empty:
         print(f"No active HH strategy signals. Current HH: ${current_price:.3f}")
         return
 
+    # Pick the highest conviction Henry Hub signal
     top_signal = hh_strategies.sort_values(by="Conviction", ascending=False).iloc[0]
+    
     direction = top_signal["Signal"]
     strategy_name = top_signal["Strategy"]
     conviction = top_signal["Conviction"]
     reason = top_signal["Reason"]
 
+    # Filter by Henry Hub conviction threshold (>= 0.60)
+    if conviction < 0.60:
+        print(f"Top HH signal {direction} conviction ({conviction:.2f}) below threshold (0.60). Current HH: ${current_price:.3f}")
+        return
+
+    # Calculate dynamic risk parameters
+    rolling_std = latest_row["HH_VOL"]
+    rolling_mean = df_regimes["HH"].rolling(20).mean().iloc[-1]
+    risk_params = calculate_trade_parameters(current_price, direction, rolling_std, rolling_mean)
+
     composite_score = signals_dict.get("Composite", 0)
     composite_text = "BUY" if composite_score == 1 else "SELL" if composite_score == -1 else "HOLD"
 
-    current_signal_state = f"{direction}_{strategy_name}_{composite_text}"
+    current_signal_state = f"HH_{direction}_{strategy_name}_{composite_text}"
 
-    if conviction > 0.60 and current_signal_state != LAST_SIGNAL_STATE:
+    if current_signal_state != LAST_SIGNAL_STATE:
         LAST_SIGNAL_STATE = current_signal_state
+        
         alert_text = (
             f"🚨 *Henry Hub Trade Alert* 🚨\n\n"
+            f"**Asset:** `Henry Hub (NG=F)`\n"
             f"**Action:** `{direction}`\n"
-            f"**Price:** `${current_price:.3f}`\n"
+            f"**Entry Price:** `${current_price:.3f}`\n"
             f"**Strategy:** {strategy_name}\n"
             f"**Conviction:** {conviction * 100:.1f}%\n"
-            f"**Trigger:** {reason}\n"
-            f"**Market State:** `{market_state}`\n"
-            f"**Composite Model:** {composite_text}"
+            f"**Trigger:** {reason}\n\n"
+            f"--- *RISK MANAGEMENT* ---\n"
+            f"**Stop Loss:** `${risk_params['sl']}`\n"
+            f"**Take Profit:** `${risk_params['tp']}`\n"
+            f"**Risk/Reward:** `1:{risk_params['rr']}`\n"
+            f"**Max Hold:** `60 mins`\n\n"
+            f"**Market State:** `{market_state}`"
         )
         send_telegram_alert(alert_text)
-        print(f"Alert sent! {direction} at ${current_price:.3f}")
+        print(f"Alert sent! HH {direction} at ${current_price:.3f}")
 
 def calculate_trade_parameters(entry_price: float, signal_type: str, rolling_std: float, rolling_mean: float):
     """
