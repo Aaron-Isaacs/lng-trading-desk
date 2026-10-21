@@ -55,24 +55,36 @@ def calculate_trade_parameters(entry_price: float, signal_type: str, rolling_std
     return {"sl": round(stop_loss, 3), "tp": round(take_profit, 3), "rr": round(rr, 2)}
 
 def fetch_market_data():
+    print("Fetching latest Henry Hub market data via Direct API...")
     try:
-        # Request 7 days to guarantee sufficient candles even across market closes
-        hh_raw = yf.Ticker("NG=F").history(period="7d", interval="5m")
-        if hh_raw.empty:
-            print("⚠️ Warning: yfinance returned empty DataFrame for NG=F (Possible Rate Limit).")
+        url = "https://query1.finance.yahoo.com/v8/finance/chart/NG=F?interval=5m&range=5d"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        res = requests.get(url, headers=headers, timeout=10)
+        
+        if res.status_code != 200:
+            print(f"❌ Yahoo API HTTP Error: {res.status_code}")
             return pd.DataFrame()
 
-        df = pd.DataFrame()
-        df["HH"] = hh_raw["Close"].ffill().dropna()
+        data = res.json()
+        result = data["chart"]["result"][0]
+        timestamps = result["timestamp"]
+        closes = result["indicators"]["quote"][0]["close"]
+
+        df = pd.DataFrame({"HH": closes}, index=pd.to_datetime(timestamps, unit="s"))
+        df = df.dropna()
 
         if len(df) < 25:
             print(f"⚠️ Warning: Insufficient candles fetched ({len(df)}/25 minimum).")
             return pd.DataFrame()
 
+        # Synthetic proxies for pipeline compatibility
         df["TTF"] = df["HH"] * 4.0
         df["JKM"] = df["TTF"] * 1.15
         df["ARA_COAL"] = 100.0
         df["NEWC_COAL"] = 100.0
+
         return df
     except Exception as e:
         print(f"❌ Error fetching market data: {e}")
