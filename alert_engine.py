@@ -7,6 +7,8 @@ import pandas as pd
 import numpy as np
 from flask import Flask
 import urllib.parse
+import json
+from openai import OpenAI
 
 # Point to 'src' directory for custom modules (leaves your Streamlit desk untouched)
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "src")))
@@ -18,13 +20,16 @@ from strategies import get_all_strategy_signals
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 LAST_SIGNAL_STATE = None
 
 app = Flask(__name__)
 
+
 @app.route("/")
 def home():
     return "🟢 LNG Alert Engine is active and running!"
+
 
 def send_telegram_alert(message: str):
     if not TELEGRAM_TOKEN or not CHAT_ID:
@@ -41,22 +46,24 @@ def send_telegram_alert(message: str):
     except Exception as e:
         print(f"❌ Failed to send Telegram alert: {e}")
 
+
 def calculate_trade_parameters(entry_price: float, signal_type: str, rolling_std: float, rolling_mean: float):
     # Volatility-based stop loss (1.5x standard deviation, minimum $0.02)
     stop_distance = max(1.5 * rolling_std, 0.02)
-    
+
     if signal_type in ["SHORT", "SELL"]:
         stop_loss = entry_price + stop_distance
         take_profit = min(rolling_mean, entry_price - (1.5 * stop_distance))
     else:  # LONG / BUY
         stop_loss = entry_price - stop_distance
         take_profit = max(rolling_mean, entry_price + (1.5 * stop_distance))
-    
+
     risk = abs(entry_price - stop_loss)
     reward = abs(take_profit - entry_price)
     rr = reward / risk if risk > 0 else 0
-    
+
     return {"sl": round(stop_loss, 3), "tp": round(take_profit, 3), "rr": round(rr, 2)}
+
 
 def fetch_market_data():
     print("Fetching latest Henry Hub market data...")
@@ -65,18 +72,18 @@ def fetch_market_data():
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
-    
+
     try:
         # 1. Try direct connection first (in case Render IP ban lifts)
         res = requests.get(target_url, headers=headers, timeout=10)
-        
+
         # 2. If Render's IP is banned (HTTP 429), route through free public proxy
         if res.status_code != 200:
             print(f"⚠️ Yahoo direct returned {res.status_code}. Rerouting through proxy...")
             encoded_url = urllib.parse.quote(target_url, safe='')
             proxy_url = f"https://api.allorigins.win/raw?url={encoded_url}"
             res = requests.get(proxy_url, timeout=15)
-            
+
             if res.status_code != 200:
                 print(f"❌ Proxy also failed with HTTP {res.status_code}")
                 return pd.DataFrame()
@@ -105,6 +112,62 @@ def fetch_market_data():
     except Exception as e:
         print(f"❌ Error fetching market data: {e}")
         return pd.DataFrame()
+
+
+def evaluate_trade_with_ai(current_price, direction, strategy_name, conviction, market_state):
+    """
+    Acts as the Chief Risk Officer. Takes quantitative data and returns a JSON decision.
+    """
+    if not OPENAI_API_KEY:
+        print("⚠️ No OpenAI API key found. Defaulting to standard 60-min hold.")
+        return {"approved": True, "max_hold_mins": 60, "reason": "No AI configured. Default approval."}
+
+    client = OpenAI(api_key=OPENAI_API_KEY)
+
+    # Get current UTC time to give the AI context on market hours
+    current_utc_time = time.strftime("%H:%M UTC")
+
+    prompt = f"""
+    You are the Chief Risk Officer for a quantitative natural gas (Henry Hub) trading desk.
+    Evaluate the following algorithmic trade setup:
+
+    - Asset: Henry Hub (NG=F)
+    - Current Price: ${current_price:.3f}
+    - Action: {direction}
+    - Strategy: {strategy_name}
+    - Algo Conviction: {conviction * 100:.1f}%
+    - Market State Regime: {market_state}
+    - Current Time: {current_utc_time}
+
+    Rules:
+    1. Mean Reversion trades in low-volume/downtrend US afternoon sessions (18:00 - 21:00 UTC) are highly dangerous.
+    2. Overnight sessions (00:00 - 12:00 UTC) are algorithmic and range-bound, favoring longer hold times (up to 120 mins).
+    3. High conviction Trend trades should be approved with standard 45-60 min holds.
+
+    Respond ONLY in raw JSON format with exactly three keys:
+    "approved" (boolean), "max_hold_mins" (integer), and "reason" (string under 30 words).
+    """
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4-turbo-preview",  # or gpt-3.5-turbo to save costs
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": "You are a quantitative risk management API. Output valid JSON only."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.1  # Low temperature for logical, consistent decisions
+        )
+
+        # Parse the JSON output from the AI
+        ai_decision = json.loads(response.choices[0].message.content)
+        return ai_decision
+
+    except Exception as e:
+        print(f"❌ AI Evaluation Error: {e}")
+        # Fail open with default parameters if the API crashes
+        return {"approved": True, "max_hold_mins": 60, "reason": "AI API timeout. Defaulting to math engine."}
+
 
 def evaluate_strategy():
     global LAST_SIGNAL_STATE
@@ -145,39 +208,53 @@ def evaluate_strategy():
     conviction = top_signal["Conviction"]
     reason = top_signal["Reason"]
 
-    print(f"📊 Evaluated HH: ${current_price:.3f} | Top: {strategy_name} {direction} | Conviction: {conviction*100:.1f}%")
+    print(
+        f"📊 Evaluated HH: ${current_price:.3f} | Top: {strategy_name} {direction} | Conviction: {conviction * 100:.1f}%")
 
-    # Gatekeeper: Require >= 60% conviction
+    # Gatekeeper 1: Math Requirement
     if conviction < 0.60:
         return
 
-    # Calculate Stop Loss, Take Profit, and Risk/Reward
+    current_signal_state = f"HH_{direction}_{strategy_name}"
+
+    # Prevent duplicate processing
+    if current_signal_state == LAST_SIGNAL_STATE:
+        return
+
+    LAST_SIGNAL_STATE = current_signal_state
+
+    # Gatekeeper 2: AI Risk Officer Evaluation
+    print("🧠 Math edge detected. Pinging AI Risk Manager for approval...")
+    ai_decision = evaluate_trade_with_ai(current_price, direction, strategy_name, conviction, market_state)
+
+    if not ai_decision["approved"]:
+        print(f"🛑 Trade Vetoed by AI: {ai_decision['reason']}")
+        # Send a veto alert to Telegram so you can see the AI protecting you
+        send_telegram_alert(
+            f"🛑 *TRADE VETOED BY AI*\n\n**Action:** `{direction} HH`\n**Reason:** {ai_decision['reason']}")
+        return
+
+    # Calculate Stop Loss & Take Profit
     rolling_std = latest_row["HH_VOL"]
     rolling_mean = df_regimes["HH"].rolling(20).mean().iloc[-1]
     risk_params = calculate_trade_parameters(current_price, direction, rolling_std, rolling_mean)
 
-    composite_score = signals_dict.get("Composite", 0)
-    composite_text = "BUY" if composite_score == 1 else "SELL" if composite_score == -1 else "HOLD"
-    current_signal_state = f"HH_{direction}_{strategy_name}_{composite_text}"
-
-    if current_signal_state != LAST_SIGNAL_STATE:
-        LAST_SIGNAL_STATE = current_signal_state
-        alert_text = (
-            f"🚨 *Henry Hub Trade Alert* 🚨\n\n"
-            f"**Asset:** `Henry Hub (NG=F)`\n"
-            f"**Action:** `{direction}`\n"
-            f"**Entry Price:** `${current_price:.3f}`\n"
-            f"**Strategy:** {strategy_name}\n"
-            f"**Conviction:** {conviction * 100:.1f}%\n"
-            f"**Trigger:** {reason}\n\n"
-            f"--- *RISK MANAGEMENT* ---\n"
-            f"**Stop Loss:** `${risk_params['sl']}`\n"
-            f"**Take Profit:** `${risk_params['tp']}`\n"
-            f"**Risk/Reward:** `1:{risk_params['rr']}`\n"
-            f"**Max Hold Duration:** `60 mins`\n\n"
-            f"**Market State:** `{market_state}`"
-        )
-        send_telegram_alert(alert_text)
+    # Format the final approved alert
+    alert_text = (
+        f"✅ *AI-Approved Trade Alert* 🚨\n\n"
+        f"**Asset:** `Henry Hub (NG=F)`\n"
+        f"**Action:** `{direction}`\n"
+        f"**Entry Price:** `${current_price:.3f}`\n"
+        f"**Strategy:** {strategy_name}\n"
+        f"**Math Conviction:** {conviction * 100:.1f}%\n"
+        f"**Market State:** `{market_state}`\n\n"
+        f"--- *AI RISK PARAMETERS* ---\n"
+        f"**Stop Loss:** `${risk_params['sl']}`\n"
+        f"**Take Profit:** `${risk_params['tp']}`\n"
+        f"**AI Max Hold:** `{ai_decision['max_hold_mins']} mins`\n"
+        f"**AI Rationale:** {ai_decision['reason']}"
+    )
+    send_telegram_alert(alert_text)
 
 def run_loop():
     print("🚀 Starting background HH strategy monitoring loop...")
@@ -188,6 +265,7 @@ def run_loop():
         except Exception as e:
             print(f"❌ Engine loop error: {e}")
         time.sleep(300)
+
 
 # Start background thread for 24/7 monitoring
 loop_thread = threading.Thread(target=run_loop, daemon=True)
