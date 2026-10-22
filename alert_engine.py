@@ -9,6 +9,7 @@ from flask import Flask
 import urllib.parse
 import json
 from openai import OpenAI
+import datetime
 
 # Point to 'src' directory for custom modules (leaves your Streamlit desk untouched)
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "src")))
@@ -22,6 +23,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 LAST_SIGNAL_STATE = None
+ACTIVE_TRADES = []
 
 app = Flask(__name__)
 
@@ -239,6 +241,8 @@ def evaluate_strategy():
     rolling_mean = df_regimes["HH"].rolling(20).mean().iloc[-1]
     risk_params = calculate_trade_parameters(current_price, direction, rolling_std, rolling_mean)
 
+    # ... (Keep the AI evaluation and Stop Loss/Take Profit math the same) ...
+
     # Format the final approved alert
     alert_text = (
         f"✅ *AI-Approved Trade Alert* 🚨\n\n"
@@ -256,6 +260,53 @@ def evaluate_strategy():
     )
     send_telegram_alert(alert_text)
 
+    # --- NEW: LOG TRADE IN MEMORY ---
+    if ai_decision['max_hold_mins'] > 0:
+        expiry_time = datetime.datetime.utcnow() + datetime.timedelta(minutes=ai_decision['max_hold_mins'])
+
+        trade_record = {
+            "id": int(time.time()),
+            "direction": direction,
+            "entry_price": current_price,
+            "strategy": strategy_name,
+            "expiry_time": expiry_time
+        }
+        ACTIVE_TRADES.append(trade_record)
+        print(f"📝 Trade stored in memory. Expiry set for: {expiry_time.strftime('%H:%M:%S UTC')}")
+
+
+def order_manager_loop():
+    """
+    Background process that wakes up every 60 seconds to enforce AI time-stops.
+    """
+    print("🛡️ Order Manager online. Monitoring active positions...")
+    while True:
+        try:
+            now = datetime.datetime.utcnow()
+
+            # Iterate over a copy of the list [:] so we can safely remove items
+            for trade in ACTIVE_TRADES[:]:
+                if now >= trade["expiry_time"]:
+                    # Time breached!
+                    alert_text = (
+                        f"⏱️ *AI TIME-STOP TRIGGERED* ⏱️\n\n"
+                        f"**Action:** `CLOSE {trade['direction']}`\n"
+                        f"**Strategy:** {trade['strategy']}\n"
+                        f"**Original Entry:** `${trade['entry_price']:.3f}`\n\n"
+                        f"Reason: The AI's dynamic hold window has expired. Close at market immediately."
+                    )
+                    send_telegram_alert(alert_text)
+                    print(f"⏱️ Time stop enforced for {trade['strategy']} {trade['direction']}")
+
+                    # Remove the trade from memory so we don't alert again
+                    ACTIVE_TRADES.remove(trade)
+
+        except Exception as e:
+            print(f"❌ Order manager error: {e}")
+
+        time.sleep(60)  # Wake up every 1 minute
+
+
 def run_loop():
     print("🚀 Starting background HH strategy monitoring loop...")
     send_telegram_alert("🟢 *LNG Alert Engine Online*\nMonitoring Henry Hub setups with dynamic risk management.")
@@ -267,9 +318,13 @@ def run_loop():
         time.sleep(300)
 
 
-# Start background thread for 24/7 monitoring
+# Start background thread for 24/7 signal monitoring
 loop_thread = threading.Thread(target=run_loop, daemon=True)
 loop_thread.start()
+
+# Start background thread for position management (NEW)
+manager_thread = threading.Thread(target=order_manager_loop, daemon=True)
+manager_thread.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
