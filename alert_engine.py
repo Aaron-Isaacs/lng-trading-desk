@@ -124,15 +124,19 @@ def evaluate_trade_with_ai(current_price, direction, strategy_name, conviction, 
         print("⚠️ No OpenAI API key found. Defaulting to standard 60-min hold.")
         return {"approved": True, "max_hold_mins": 60, "reason": "No AI configured. Default approval."}
 
-    client = OpenAI(api_key=OPENAI_API_KEY)
-
-    # Get current UTC time to give the AI context on market hours
+    # FIX 1: Explicitly set a 60-second timeout and 3 automatic retries for network resilience
+    client = OpenAI(
+        api_key=OPENAI_API_KEY,
+        timeout=60.0,
+        max_retries=3
+    )
+    
     current_utc_time = time.strftime("%H:%M UTC")
 
     prompt = f"""
     You are the Chief Risk Officer for a quantitative natural gas (Henry Hub) trading desk.
     Evaluate the following algorithmic trade setup:
-
+    
     - Asset: Henry Hub (NG=F)
     - Current Price: ${current_price:.3f}
     - Action: {direction}
@@ -140,35 +144,42 @@ def evaluate_trade_with_ai(current_price, direction, strategy_name, conviction, 
     - Algo Conviction: {conviction * 100:.1f}%
     - Market State Regime: {market_state}
     - Current Time: {current_utc_time}
-
+    
     Rules:
     1. Mean Reversion trades in low-volume/downtrend US afternoon sessions (18:00 - 21:00 UTC) are highly dangerous.
     2. Overnight sessions (00:00 - 12:00 UTC) are algorithmic and range-bound, favoring longer hold times (up to 120 mins).
     3. High conviction Trend trades should be approved with standard 45-60 min holds.
-
+    
     Respond ONLY in raw JSON format with exactly three keys:
     "approved" (boolean), "max_hold_mins" (integer), and "reason" (string under 30 words).
     """
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4-turbo-preview",  # or gpt-3.5-turbo to save costs
-            response_format={"type": "json_object"},
+            model="gpt-4o-mini", # Swapped to the fastest/cheapest model to prevent timeouts
+            response_format={ "type": "json_object" },
             messages=[
                 {"role": "system", "content": "You are a quantitative risk management API. Output valid JSON only."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.1  # Low temperature for logical, consistent decisions
+            temperature=0.1
         )
-
-        # Parse the JSON output from the AI
+        
         ai_decision = json.loads(response.choices[0].message.content)
         return ai_decision
 
     except Exception as e:
-        print(f"❌ AI Evaluation Error: {e}")
-        # Fail open with default parameters if the API crashes
-        return {"approved": True, "max_hold_mins": 60, "reason": "AI API timeout. Defaulting to math engine."}
+        # FIX 2: Unmask the exact OpenAI error type and message in the Render logs
+        error_type = type(e).__name__
+        error_msg = str(e)
+        print(f"❌ AI API Crash -> [{error_type}]: {error_msg}")
+        
+        # Fall back to math logic so the trade isn't missed
+        return {
+            "approved": True, 
+            "max_hold_mins": 60, 
+            "reason": f"AI Fallback triggered due to {error_type}"
+        }
 
 
 def evaluate_strategy():
